@@ -1,22 +1,42 @@
-// Version 2.1.0
-// Introduces a token that is shared between the proxy and client for managing the connection
-// Token handling ensures that one client (instance) cannot have multiple connections
+// Version 2.1.1
+// Fixes issue with modified record calls not looping beyond 10,000 records
+// Provides better handling of connection errors so synchronised timestamps do not advance if connection is not made
+// Provides a regex for conforming dates and number strings back to date and number objects via mode types
+// Introduces mode hooks for managing the events such as on start, on batch, on complete and so on
 
 // ---------------------------------------------
 // Helper Function Start
 // ---------------------------------------------
 
 // ---------------------------------------------
-// Global Session Token Registry
+// Globals
 // ---------------------------------------------
 
+const reg_date = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+const reg_number = /^-?\d+(?:\.\d+)?$/;
 const odata_tokens = {};
 
 // ---------------------------------------------
 // Shared Helpers
 // ---------------------------------------------
 
-let odata_abort = new AbortController();
+let odata_abort
+
+function getSerial(rows, field, current)
+{
+	var hi = current;
+	for (var i = 0; i < rows.length; i++)
+	{
+		var v = Number(rows[i][field]);
+		if (isFinite(v) && (hi == null || v > hi)) hi = v;
+	}
+	return hi;
+}
+
+function checkHalt()
+{
+	return (odata_abort && odata_abort.signal && odata_abort.signal.aborted === true) || callProxy.error === true || callProxy.fetch_aborted === true;
+}
 
 function encodeField(field)
 {
@@ -26,7 +46,7 @@ function encodeField(field)
 function encodeValue(val)
 {
 	if (val instanceof Date) return val.toISOString();
-	if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(val)) return val;
+	if (typeof val === 'string' && reg_date.test(val)) return val;
 	if (typeof val === 'string') return "'" + val.replace(/'/g, "''") + "'";
 	if (typeof val !== 'number' && typeof val !== 'boolean') return "'" + String(val) + "'";
 	return val;
@@ -121,7 +141,7 @@ async function callProxy(url, config, token)
 		if (token && odata_tokens[instance] !== token)
 		{
 			console.warn("Aborting due to session token mismatch");
-			return;
+			return [];
 		}
 
 		const response = await fetch(proxy.url, { headers: proxy.headers, signal: odata_abort.signal });
@@ -131,82 +151,133 @@ async function callProxy(url, config, token)
 	}
 	catch (error)
 	{
-	if (error.name === "AbortError" || error.message === "Load failed")
-	{
-		console.warn("ODATA fetch aborted by navigation or reload");
-		callProxy.fetch_aborted = true;
-	}
-	return [];
+		if (error && (error.name === "AbortError" || error.message === "Load failed"))
+		{
+			console.warn("ODATA fetch aborted by navigation or reload");
+			callProxy.fetch_aborted = true;
+		}
+		else
+		{
+			console.error("ODATA fetch error:", error && error.message ? error.message : error);
+			callProxy.error = true;
+		}
+		return [];
 	}
 }
 
 function compileMapping(config_select, table_base)
 {
 	const mapping = [];
-	Object.keys(config_select).forEach(table =>
+	Object.keys(config_select).forEach(function(table)
 	{
 		const fields = config_select[table];
 		const path_source = (table === table_base) ? null : table;
 
-		Object.keys(fields).forEach(field_fm =>
+		Object.keys(fields).forEach(function(field_fm)
 		{
 			const rule = fields[field_fm];
 			const key_target = typeof rule === 'object' && rule !== null ? rule.key : rule;
 			const isArray = typeof rule === 'object' && rule.isArray;
 			const delimiter = typeof rule === 'object' ? (rule.delimiter || '\n') : null;
 
-			mapping.push({ field_fm, key_target, path_source, isArray, delimiter });
+			mapping.push({ field_fm: field_fm, key_target: key_target, path_source: path_source, isArray: isArray, delimiter: delimiter });
 		});
 	});
 	return mapping;
 }
 
-function applyMapping(data, mapping_instruction)
+function normaliseTypes(key, value, types)
 {
-	return data.map(record =>
+	if (!types) return value;
+
+	var type_found = types[key];
+	if (!type_found) return value;
+
+	// Extremely low compute checks
+	if (type_found === 'number')
 	{
-		let mapped = {};
-		mapping_instruction.forEach(item =>
+		if (typeof value === 'number') return value;
+		if (typeof value === 'string' && value.length <= 15 && reg_number.test(value)) return Number(value);
+		return value;
+	}
+
+	if (type_found === 'date')
+	{
+		if (value instanceof Date) return value;
+		if (typeof value === 'string' && reg_date.test(value)) return new Date(value);
+		return value;
+	}
+
+	return value;
+}
+
+function applyMapping(data, mapping_instruction, types)
+{
+	var len = data.length;
+	var out = new Array(len);
+
+	for (var i = 0; i < len; i++)
+	{
+		var record = data[i];
+		var mapped = {};
+
+		for (var j = 0, m = mapping_instruction.length; j < m; j++)
 		{
-			const source = item.path_source
-				? (Array.isArray(record[item.path_source]) ? record[item.path_source][0] || {} : record[item.path_source] || {})
+			var item = mapping_instruction[j];
+			var source = item.path_source
+				? (Array.isArray(record[item.path_source]) ? (record[item.path_source][0] || {}) : (record[item.path_source] || {}))
 				: record;
 
-			let value = source[item.field_fm];
-			if (item.isArray && typeof value === 'string')
+			var v = source[item.field_fm];
+
+			if (item.isArray && typeof v === 'string')
 			{
-				if (item.delimiter === '\n') value = value.replace(/\r\n|\r/g, '\n');
-				mapped[item.key_target] = value.split(item.delimiter).map(v => v.trim()).filter(Boolean);
+				if (item.delimiter === '\n') v = v.replace(/\r\n|\r/g, '\n');
+				var parts = v.split(item.delimiter);
+				var arr = [];
+				for (var k = 0, p = parts.length; k < p; k++)
+				{
+					var s = parts[k].trim();
+					if (s) arr.push(s);
+				}
+				mapped[item.key_target] = arr;
 			}
 			else
 			{
-				mapped[item.key_target] = item.field_fm in source ? value : null;
+				mapped[item.key_target] = (item.field_fm in source) ? normaliseTypes(item.key_target, v, types) : null;
 			}
-		});
-		return mapped;
-	});
+		}
+
+		out[i] = mapped;
+	}
+
+	return out;
 }
 
 // ---------------------------------------------
 // Count Query (Optional)
 // ---------------------------------------------
 
-async function getCount(config)
+async function getCount(config, count_mode)
 {
 	const { table, file, server } = config;
 	const instance = config.instance || "default";
 	const session_token = Date.now().toString(36) + Math.random().toString(36).substring(2);
 	odata_tokens[instance] = session_token;
+	
 	// Request only one record with the count field
-	const count_field = config.mode.count_field || "_Count"; // Default fallback field
+	const count_field = config.mode.count_field || "_Count";
 	const select_fields = { [table]: { [count_field]: count_field } };
 	let count_filter = { ...config.filter };
-
-	if (config.mode && config.mode.type === 'modified')
+	// Apply modified window only when explicitly requested
+	if (count_mode === 'modified')
 	{
-		const modify_field = config.mode.modify_field || 'Timestamp Modify';
 		const sync_state = loadSync(file, table);
-		if (sync_state.sync_timestamp) count_filter[modify_field] = { ge: sync_state.sync_timestamp };
+		if (sync_state && sync_state.sync_timestamp)
+		{
+			const modify_field = config.mode.modify_field || 'Timestamp Modify';
+			count_filter[modify_field] = { ge: sync_state.sync_timestamp };
+		}
 	}
 
 	const query_parts = queryODATA(select_fields, count_filter, table);
@@ -227,11 +298,14 @@ async function getData(config)
 	const instance = config.instance || "default";
 	const session_token = Date.now().toString(36) + Math.random().toString(36).substring(2);
 	odata_tokens[instance] = session_token;
+
 	const limit = mode.limit || 10000;
 	const cache = mode.cache !== false;
 	const stream = mode.streaming !== false;
 	const serial_field = (typeof config.mode.serial_field === 'string' && config.mode.serial_field.trim()) ? config.mode.serial_field.trim() : "_ID Serial";
-	const modify_field = config.mode.modify_field || 'Timestamp Modify'
+	const modify_field = config.mode.modify_field || 'Timestamp Modify';
+	const types = (mode.types && typeof mode.types === 'object') ? mode.types : null;
+	const hooks = (mode.hooks && typeof mode.hooks === 'object') ? mode.hooks : null;
 
 	// Always ensure the serial field is included in select
 	if (!config.select[table][serial_field]) config.select[table][serial_field] = serial_field;
@@ -244,110 +318,125 @@ async function getData(config)
 	const sync_type = cache ? (!sync_state.sync_complete ? 'full' : 'modified') : 'live';
 	const timestamp_start = new Date();
 
-	// Only set sync timestamp once, when starting full sync for the first time
+	if (hooks && typeof hooks.onStart === 'function') try { hooks.onStart({ sync: sync_type }); } catch(e) {}
+
+	// Only set sync timestamp once
 	if (sync_type === 'full' && !sync_state.sync_timestamp)
 	{
 		sync_state.sync_timestamp = timestamp_start;
 		saveSync(file, table, sync_state);
 	}
 
-	// Add timestamp filter for modified mode
-	if (sync_type === 'modified' && sync_state.sync_timestamp) base_filter[modify_field] = { ge: sync_state.sync_timestamp };
-
 	let results = [];
 	let put_queue = [];
 	let fetched;
-	let serial_paging = false;
 
-	do
+	// Full or live
+	if (sync_type === 'full' || sync_type === 'live')
 	{
-		if (odata_abort.signal.aborted)
+		do
 		{
-			console.warn("Fetch aborted during retrieval");
-			break;
-		}
+			if (checkHalt()) { console.warn("Fetch aborted or error"); break; }
 
-		let batch_filter = { ...base_filter };
+			var batch_filter = { ...base_filter };
+			if (serial_last !== null) batch_filter[serial_field] = { gt: serial_last };
 
-		// Full mode always page by serial, modified only after first page
-		if (serial_last !== null && (sync_type === 'full' || serial_paging))
-		{
-			batch_filter[serial_field] = { gt: serial_last };
-		}
+			var qp = queryODATA(config.select, batch_filter, table);
+			var url = getURL(server, file, table, qp, limit);
+			fetched = await callProxy(url, config, session_token);
+			if (!fetched.length) break;
 
-		const query_parts = queryODATA(config.select, batch_filter, table);
-		const url = getURL(server, file, table, query_parts, limit);
+			var mapped = applyMapping(fetched, map_compiled, types);
 
-		fetched = await callProxy(url, config, session_token);
-		if (!fetched.length) break;
+			if (cache && typeof putData === 'function') await putData(mapped);
+			if (!cache)
+			{
+				if (typeof putData === 'function') put_queue.push(putData(mapped));
+				if (!stream) results.push.apply(results, mapped);
+			}
 
-		const mapped = applyMapping(fetched, map_compiled);
+			serial_last = getSerial(fetched, serial_field, serial_last);
 
-		if (cache)
-		{
-			// Only promise when not caching due to order of operations when navigating to and from
-			if (typeof putData === 'function') await putData(mapped);
+			if (hooks && typeof hooks.onBatch === 'function') try { hooks.onBatch({ size: fetched.length, serial_last: serial_last }); } catch(e) {}
 
-			if (sync_type === 'full')
+			if (cache)
 			{
 				sync_state.serial_last = serial_last;
 				saveSync(file, table, sync_state);
 			}
+		}
+		while (fetched.length === limit);
 
-			if (sync_type === 'modified' && fetched.length === limit)
+		if (!cache) await Promise.all(put_queue);
+
+		if (cache && sync_type === 'full' && fetched && fetched.length < limit && callProxy.fetch_aborted === false && callProxy.error !== true)
+		{
+			sync_state.sync_complete = true;
+			saveSync(file, table, sync_state);
+		}
+	}
+
+	// Modified records
+	if (cache && sync_type === 'modified')
+	{
+		var keep_checking = true;
+		while (keep_checking)
+		{
+			if (checkHalt()) { console.warn("Fetch aborted or error"); break; }
+
+			var cycle_start = new Date();
+			var cycle_processed = 0;
+			var page_serial = null;
+			var cycle_ok = true;
+
+			do
 			{
-				serial_paging = true;
+				if (checkHalt()) { console.warn("Fetch aborted or error"); cycle_ok = false; break; }
+
+				var bf = { ...base_filter };
+				if (sync_state.sync_timestamp) bf[modify_field] = { ge: sync_state.sync_timestamp };
+				if (page_serial !== null) bf[serial_field] = { gt: page_serial };
+
+				var qp_mod = queryODATA(config.select, bf, table);
+				var url_mod = getURL(server, file, table, qp_mod, limit);
+				fetched = await callProxy(url_mod, config, session_token);
+				if (!fetched.length) break;
+
+				var mapped_mod = applyMapping(fetched, map_compiled, types);
+				if (typeof putData === 'function') await putData(mapped_mod);
+				cycle_processed += fetched.length;
+
+				page_serial = getSerial(fetched, serial_field, page_serial);
+
+				if (hooks && typeof hooks.onBatch === 'function') try { hooks.onBatch({ size: fetched.length, serial_last: page_serial }); } catch(e) {}
+			}
+			while (fetched.length === limit);
+
+			if (checkHalt()) { console.warn("Fetch aborted or error"); cycle_ok = false; }
+
+			// Advance cycle only when the whole cycle completed
+			if (cycle_processed === 0) { keep_checking = false; break; }
+			if (cycle_ok)
+			{
+				sync_state.sync_timestamp = cycle_start;
+				saveSync(file, table, sync_state);
 			}
 		}
-		else
-		{
-			if (typeof putData === 'function') put_queue.push(putData(mapped));
-			if (!stream) results.push(...mapped);
-		}
-
-		let highest = serial_last;
-		for (let i = 0; i < fetched.length; i++)
-		{
-			const val = Number(fetched[i][serial_field]);
-			if (isFinite(val) && (highest == null || val > highest)) highest = val;
-		}
-
-		if (highest === serial_last)
-		{
-			console.warn("No serial progression detected");
-			break;
-		}
-
-		serial_last = highest;
-
-	} while (fetched.length === limit);
-	
-	if ( !cache ) await Promise.all(put_queue);
-
-	if (cache && sync_type === 'full' && fetched.length < limit && callProxy.fetch_aborted === false)
-	{
-		sync_state.sync_complete = true;
-		saveSync(file, table, sync_state);
-	}
-	else if (cache && sync_type === 'modified')
-	{
-		// Only update timestamp after modified sync finishes
-		sync_state.sync_timestamp = timestamp_start;
-		saveSync(file, table, sync_state);
 	}
 
 	if (cache && sync_type === 'modified' && callProxy.fetch_aborted === false && typeof window.putRecount === 'function')
 	{
-		// Recount hook for consistency check
-		const server_recount = await getCount(config);
+		const server_recount = await getCount(config, 'base');
 		window.putRecount(server_recount);
 	}
 
 	delete odata_tokens[instance];
+
+	if (hooks && typeof hooks.onComplete === 'function') try { hooks.onComplete({ sync: sync_type, duration: (new Date().getTime() - timestamp_start.getTime()) }); } catch(e) {}
 	if (typeof onSync === 'function') onSync(sync_type);
+
 	return !stream && !cache ? results : undefined;
 }
-
 
 // ---------------------------------------------
 // Unified Entry Point
@@ -355,14 +444,17 @@ async function getData(config)
 
 async function callODATA(config)
 {
+	odata_abort = new AbortController();
 	console.time('ODATA Retrieval');
 	callProxy.fetch_aborted = false;
+	callProxy.error = false;
 	let server_count = 0;
 
-	// Optional count query
-	if (config.mode.count === true)
+	if (config.mode && config.mode.count === true)
 	{
-		server_count = await getCount(config);
+		var sync_probe = loadSync(config.file, config.table);
+		var count_mode = (sync_probe && sync_probe.sync_complete === true && sync_probe.sync_timestamp) ? 'modified' : 'base';
+		server_count = await getCount(config, count_mode);
 		if (typeof window.putRange === 'function') window.putRange(server_count);
 	}
 
