@@ -1,26 +1,89 @@
-// Version 2.2.0
-// Removes the thread option and ensures all calls are made serialised
-// Removed window call backs and provided additional hooks for greater use
-// Only counts when count and recount hooks are supplied
-// Hardened error logic and performs further checks for required data such as table and corrupt sync variables
+// Version 2.2.1
+// Refactoring and renaming of functions and objects
+// Dramatically improved error handling with clearer feedback in console
 
-// ---------------------------------------------
-// Helper Function Start
-// ---------------------------------------------
-
-// ---------------------------------------------
+// =====================================
 // Globals
-// ---------------------------------------------
+// =====================================
 
-const re_date = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
-const re_number = /^-?\d+(?:\.\d+)?$/;
-const odata_tokens = {};
+var RE_DATE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+var RE_NUMBER = /^-?\d+(?:\.\d+)?$/;
 
-let odata_abort = new AbortController();
+var odata_tokens = {};
+var odata_abort = new AbortController();
 
-// ---------------------------------------------
+// =====================================
+// Error helper
+// =====================================
+
+var ERR_CONFIG = "CONFIG_ERROR";
+var ERR_AUTH = "AUTH_ERROR";
+var ERR_NET = "NETWORK_ERROR";
+var ERR_ODATA = "ODATA_ERROR";
+var ERR_ABORT = "ABORTED";
+
+function logError(stage, code, info)
+{
+	console.error("ODATA:", stage, code, info);
+}
+
+function parseError(data)
+{
+	// API errors
+	if (!data || typeof data !== "object" || !data.error) return null;
+
+	var err = data.error;
+	var code = (err.code || "").toString();
+	var msg = (err.message && (err.message.value || err.message)) || (err.details || err.error) || "Unknown ODATA error";
+
+	if (code === "401" || code === "403" || /unauthoriz|auth/i.test(msg)) return { code: ERR_AUTH, message: msg };
+	if (/could not find a property/i.test(msg) || /property named/i.test(msg)) return { code: ERR_ODATA, message: "Field not found " + msg };
+	if (/resource could not be found.*segment/i.test(msg) || /not found/i.test(msg)) return { code: ERR_ODATA, message: "Table or path not found " + msg };
+
+	return { code: ERR_ODATA, message: msg };
+}
+
+// =====================================
+// Local state
+// =====================================
+
+function syncKey(file, table)
+{
+	return file + "-" + table + "-sync";
+}
+
+function loadSync(file, table)
+{
+	var key = syncKey(file, table);
+	try
+	{
+		var raw = localStorage.getItem(key);
+		if (!raw) return { serial_last: null, sync_timestamp: null, sync_complete: false };
+
+		var state = JSON.parse(raw);
+		if (!state || typeof state !== "object") throw new Error("Invalid sync state");
+
+		if (!("serial_last" in state)) state.serial_last = null;
+		if (!("sync_timestamp" in state)) state.sync_timestamp = null;
+		if (!("sync_complete" in state)) state.sync_complete = false;
+
+		return state;
+	}
+	catch (_e)
+	{
+		try { localStorage.removeItem(key); } catch (_err) {}
+		return { serial_last: null, sync_timestamp: null, sync_complete: false };
+	}
+}
+
+function saveSync(file, table, state)
+{
+	try { localStorage.setItem(syncKey(file, table), JSON.stringify(state)); } catch (_e) {}
+}
+
+// =====================================
 // Shared Helpers
-// ---------------------------------------------
+// =====================================
 
 function getSerial(rows, field, current)
 {
@@ -40,175 +103,121 @@ function checkHalt()
 
 function encodeField(field)
 {
-	return '"' + field.replace(/"/g, '""') + '"';
+	return '"' + String(field).replace(/"/g, '""') + '"';
 }
 
 function encodeValue(val)
 {
-	if (val === null || val === undefined) return 'null';
+	if (val === null || val === undefined) return "null";
 	if (val instanceof Date) return val.toISOString();
-	if (typeof val === 'string' && re_date.test(val)) return val;
-	if (typeof val === 'string') return "'" + val.replace(/'/g, "''") + "'";
-	if (typeof val !== 'number' && typeof val !== 'boolean') return "'" + String(val) + "'";
+	if (typeof val === "string" && RE_DATE.test(val)) return val;
+	if (typeof val === "string") return "'" + val.replace(/'/g, "''") + "'";
+	if (typeof val !== "number" && typeof val !== "boolean") return "'" + String(val) + "'";
 	return val;
 }
 
 function getHeaders(url, config)
 {
-	const proxy_url = config.proxy || "https://proxy.littleman.com.au";
-	return { url: proxy_url + '/odata/get?url=' + encodeURIComponent(url), headers: { "fm-username": config.username, "fm-password": config.password } };
+	var proxy_url = config.proxy || "https://proxy.littleman.com.au";
+	return { url: proxy_url + "/odata/get?url=" + encodeURIComponent(url), headers: { "fm-username": config.username, "fm-password": config.password } };
 }
 
 function getURL(server, file, table, query_parts, limit)
 {
-	const base = 'https://' + server + '/fmi/odata/v4/' + file + '/' + table;
-	const params = [];
+	var base = "https://" + server + "/fmi/odata/v4/" + file + "/" + table;
+	var params = [];
 
-	if (query_parts.field_select) params.push('$select=' + query_parts.field_select);
+	if (query_parts.field_select) params.push("$select=" + query_parts.field_select);
 	if (query_parts.field_expand) params.push(query_parts.field_expand);
 	if (query_parts.field_filter) params.push(query_parts.field_filter);
-	if (limit) params.push('$top=' + limit);
+	if (limit) params.push("$top=" + limit);
 
-	return params.length ? base + '?' + params.join('&') : base;
+	return params.length ? base + "?" + params.join("&") : base;
 }
 
-function loadSync(file, table)
-{
-	var key = file + '-' + table + '-sync';
-	try
-	{
-		var raw = localStorage.getItem(key);
-		if (!raw) return { serial_last: null, sync_timestamp: null, sync_complete: false };
+// =====================================
+// Query builder
+// =====================================
 
-		var state = JSON.parse(raw);
-		if (!state || typeof state !== 'object') throw new Error('Invalid sync state');
-
-		if (!('serial_last' in state)) state.serial_last = null;
-		if (!('sync_timestamp' in state)) state.sync_timestamp = null;
-		if (!('sync_complete' in state)) state.sync_complete = false;
-
-		return state;
-	}
-	catch (e)
-	{
-		// Self heal corrupted entry
-		try { localStorage.removeItem(key); } catch (_) {}
-		return { serial_last: null, sync_timestamp: null, sync_complete: false };
-	}
-}
-
-function saveSync(file, table, state)
-{
-	localStorage.setItem(file + '-' + table + '-sync', JSON.stringify(state));
-}
-
-// ---------------------------------------------
-// Query Construction
-// ---------------------------------------------
-
-function queryODATA(config_select, config_filter, table_base)
+function queryBuilder(select_cfg, filter_cfg, base_table)
 {
 	function processFilter(field, condition)
 	{
-		const field_full = encodeField(field);
+		var fld = encodeField(field);
+
 		if (Array.isArray(condition))
 		{
-			const clauses = condition.map(function(val){ return field_full + ' eq ' + encodeValue(val); });
-			return '(' + clauses.join(' or ') + ')';
+			var ors = new Array(condition.length);
+			for (var i = 0; i < condition.length; i++) ors[i] = fld + " eq " + encodeValue(condition[i]);
+			return "(" + ors.join(" or ") + ")";
 		}
-		if (typeof condition === 'object' && condition !== null)
+
+		if (condition && typeof condition === "object")
 		{
-			const pairs = Object.entries(condition);
-			const clauses = new Array(pairs.length);
-			for (var i = 0; i < pairs.length; i++)
+			var parts = [];
+			for (var op in condition)
 			{
-				var operator = pairs[i][0];
-				var val = pairs[i][1];
-				clauses[i] = operator === 'contains' ? 'contains(' + field_full + ',' + encodeValue(val) + ')' : field_full + ' ' + operator + ' ' + encodeValue(val);
+				if (!Object.prototype.hasOwnProperty.call(condition, op)) continue;
+				var val = condition[op];
+				parts.push(op === "contains" ? "contains(" + fld + "," + encodeValue(val) + ")" : fld + " " + op + " " + encodeValue(val));
 			}
-			return clauses.join(' and ');
+			return parts.join(" and ");
 		}
-		return field_full + ' eq ' + encodeValue(condition);
+
+		return fld + " eq " + encodeValue(condition);
 	}
 
-	const filter_parts = Object.entries(config_filter || {}).map(function(pair){ return processFilter(pair[0], pair[1]); });
-	const filter_string = filter_parts.length ? '$filter=' + encodeURIComponent(filter_parts.join(' and ')) : '';
-
-	var clause_select = [];
-	var clause_expand = [];
-
-	Object.keys(config_select).forEach(function (table)
+	var filter_parts = [];
+	var filter_keys = filter_cfg ? Object.keys(filter_cfg) : [];
+	for (var i = 0; i < filter_keys.length; i++)
 	{
-		const fields = Object.keys(config_select[table]).map(encodeField).join(',');
-		if (table === table_base)
-		{
-			clause_select.push(fields);
-		}
-		else
-		{
-			clause_expand.push('"' + table + '"($select=' + fields + ')');
-		}
-	});
+		var key = filter_keys[i];
+		filter_parts.push(processFilter(key, filter_cfg[key]));
+	}
+	var filter_string = filter_parts.length ? "$filter=" + encodeURIComponent(filter_parts.join(" and ")) : "";
 
-	return { field_select: encodeURIComponent(clause_select.join(',')), field_expand: clause_expand.length ? '$expand=' + clause_expand.join(',') : '', field_filter: filter_string };
+	var select_list = [];
+	var expand_list = [];
+
+	var tables = Object.keys(select_cfg || {});
+	for (var t = 0; t < tables.length; t++)
+	{
+		var table = tables[t];
+		var fields = Object.keys(select_cfg[table] || {});
+		var encoded = new Array(fields.length);
+		for (var j = 0; j < fields.length; j++) encoded[j] = encodeField(fields[j]);
+
+		if (table === base_table) select_list.push(encoded.join(","));
+		else expand_list.push('"' + table + '"($select=' + encoded.join(",") + ")");
+	}
+
+	return { field_select: encodeURIComponent(select_list.join(",")), field_expand: expand_list.length ? "$expand=" + expand_list.join(",") : "", field_filter: filter_string };
 }
 
-// ---------------------------------------------
-// Fetch & Mapping
-// ---------------------------------------------
+// =====================================
+// Mapping
+// =====================================
 
-async function callProxy(url, config, token)
+function compileMapping(select_cfg, base_table)
 {
-	const proxy = getHeaders(url, config);
-	try
+	var mapping = [];
+	var tables = Object.keys(select_cfg || {});
+	for (var i = 0; i < tables.length; i++)
 	{
-		const instance = config.instance || "default";
-		if (token && odata_tokens[instance] !== token)
-		{
-			console.warn("Aborting due to session token mismatch");
-			return [];
-		}
+		var table = tables[i];
+		var fields = select_cfg[table];
+		var path_source = (table === base_table) ? null : table;
 
-		const response = await fetch(proxy.url, { headers: proxy.headers, signal: odata_abort.signal });
-		if (!response.ok) throw new Error("HTTPS: " + response.status);
-		const data = await response.json();
-		return data.value || data || [];
+		for (var fm in fields)
+		{
+			if (!Object.prototype.hasOwnProperty.call(fields, fm)) continue;
+			var rule = fields[fm];
+			var key = (rule && typeof rule === "object") ? rule.key : rule;
+			var is_arr = !!(rule && typeof rule === "object" && rule.isArray);
+			var delim = (rule && typeof rule === "object" && rule.delimiter) ? rule.delimiter : "\n";
+			mapping.push({ fm: fm, key: key, path: path_source, arr: is_arr, delim: delim });
+		}
 	}
-	catch (error)
-	{
-		if (error && (error.name === "AbortError" || error.message === "Load failed"))
-		{
-			console.warn("ODATA fetch aborted by navigation or reload");
-			callProxy.fetch_aborted = true;
-		}
-		else
-		{
-			console.error("ODATA fetch error:", error && error.message ? error.message : error);
-			callProxy.error = true;
-			callProxy.last_error = error && error.message ? error.message : String(error);
-		}
-		return [];
-	}
-}
-
-function compileMapping(config_select, table_base)
-{
-	const mapping = [];
-	Object.keys(config_select).forEach(function(table)
-	{
-		const fields = config_select[table];
-		const path_source = (table === table_base) ? null : table;
-
-		Object.keys(fields).forEach(function(field_fm)
-		{
-			const rule = fields[field_fm];
-			const key_target = typeof rule === 'object' && rule !== null ? rule.key : rule;
-			const isArray = typeof rule === 'object' && rule.isArray;
-			const delimiter = typeof rule === 'object' ? (rule.delimiter || '\n') : null;
-
-			mapping.push({ field_fm: field_fm, key_target: key_target, path_source: path_source, isArray: isArray, delimiter: delimiter });
-		});
-	});
 	return mapping;
 }
 
@@ -216,340 +225,371 @@ function normaliseTypes(key, value, types)
 {
 	if (!types) return value;
 
-	var type_found = types[key];
-	if (!type_found) return value;
+	var want = types[key];
+	if (!want) return value;
 
-	if (type_found === 'number')
+	if (want === "number")
 	{
-		if (typeof value === 'number') return value;
-		if (typeof value === 'string' && value.length <= 15 && re_number.test(value)) return Number(value);
+		if (typeof value === "number") return value;
+		if (typeof value === "string" && value.length <= 15 && RE_NUMBER.test(value)) return Number(value);
 		return value;
 	}
 
-	if (type_found === 'date')
+	if (want === "date")
 	{
 		if (value instanceof Date) return value;
-		if (typeof value === 'string' && re_date.test(value)) return new Date(value);
+		if (typeof value === "string" && RE_DATE.test(value)) return new Date(value);
 		return value;
 	}
 
 	return value;
 }
 
-function applyMapping(data, mapping_instruction, types)
+function applyMapping(rows, mapping, types)
 {
-	var len = data.length;
-	var out = new Array(len);
+	var out = new Array(rows.length);
 
-	for (var i = 0; i < len; i++)
+	for (var i = 0; i < rows.length; i++)
 	{
-		var record = data[i];
-		var mapped = {};
+		var rec = rows[i];
+		var obj = {};
 
-		for (var j = 0, m = mapping_instruction.length; j < m; j++)
+		for (var m = 0; m < mapping.length; m++)
 		{
-			var item = mapping_instruction[j];
-			var source = item.path_source
-				? (Array.isArray(record[item.path_source]) ? (record[item.path_source][0] || {}) : (record[item.path_source] || {}))
-				: record;
+			var rule = mapping[m];
+			var src = rule.path ? (Array.isArray(rec[rule.path]) ? (rec[rule.path][0] || {}) : (rec[rule.path] || {})) : rec;
+			var v = src[rule.fm];
 
-			var v = source[item.field_fm];
-
-			if (item.isArray && typeof v === 'string')
+			if (rule.arr && typeof v === "string")
 			{
-				if (item.delimiter === '\n') v = v.replace(/\r\n|\r/g, '\n');
-				var parts = v.split(item.delimiter);
-				var arr = [];
-				for (var k = 0, p = parts.length; k < p; k++)
+				if (rule.delim === "\n") v = v.replace(/\r\n|\r/g, "\n");
+				var parts = v.split(rule.delim);
+				var a = [];
+				for (var k = 0; k < parts.length; k++)
 				{
 					var s = parts[k].trim();
-					if (s) arr.push(s);
+					if (s) a.push(s);
 				}
-				mapped[item.key_target] = arr;
+				obj[rule.key] = a;
 			}
 			else
 			{
-				mapped[item.key_target] = (item.field_fm in source) ? normaliseTypes(item.key_target, v, types) : null;
+				obj[rule.key] = (rule.fm in src) ? normaliseTypes(rule.key, v, types) : null;
 			}
 		}
 
-		out[i] = mapped;
+		out[i] = obj;
 	}
 
 	return out;
 }
 
-// ---------------------------------------------
-// Count Query
-// ---------------------------------------------
+// =====================================
+// Proxy fetch
+// =====================================
 
-async function getCount(config, count_mode)
+async function callProxy(url, config, token)
 {
-	const { table, file, server } = config;
-	const instance = config.instance || "default";
-	const session_token = Date.now().toString(36) + Math.random().toString(36).substring(2);
-	odata_tokens[instance] = session_token;
+	var proxy = getHeaders(url, config);
 
-	const count_field = (config.mode && config.mode.count_field) ? config.mode.count_field : "_Count";
-	const select_fields = {};
-	select_fields[table] = {};
-	select_fields[table][count_field] = count_field;
-
-	var count_filter = { ...(config.filter || {}) };
-
-	if (count_mode === 'modified')
+	try
 	{
-		const sync_state = loadSync(file, table);
-		if (sync_state && sync_state.sync_timestamp)
+		if (!config || !config.username || !config.password) throw { code: ERR_CONFIG, message: "Missing credentials" };
+		if (!config.server || !config.file || !config.table) throw { code: ERR_CONFIG, message: "Missing server/file/table" };
+
+		var instance = config.instance || "default";
+		if (token && odata_tokens[instance] !== token)
 		{
-			const modify_field = (config.mode && config.mode.modify_field) ? config.mode.modify_field : 'Timestamp Modify';
-			count_filter[modify_field] = { ge: sync_state.sync_timestamp };
+			console.warn("Session token mismatch aborting batch");
+			return [];
 		}
+
+		var res = await fetch(proxy.url, { headers: proxy.headers, signal: odata_abort.signal });
+		if (!res.ok)
+		{
+			// Network errors
+			if (res.status === 401 || res.status === 403) throw { code: ERR_AUTH, message: "HTTP " + res.status + " Unauthorized" };
+			if (res.status === 404) throw { code: ERR_ODATA, message: "Check file/table/path)" };
+			throw { code: ERR_NET, message: "HTTP " + res.status };
+		}
+
+		var data = await res.json();
+
+		// ODATA errors
+		var oerr = parseError(data);
+		if (oerr) throw oerr;
+
+		return data.value || data || [];
 	}
+	catch (e)
+	{
+		if (e && (e.name === "AbortError" || e.message === "Load failed"))
+		{
+			console.warn("Fetch aborted");
+			callProxy.fetch_aborted = true;
+			return [];
+		}
 
-	const query_parts = queryODATA(select_fields, count_filter, table);
-	const url = getURL(server, file, table, query_parts, 1);
+		var code = (e && e.code) ? e.code : ERR_NET;
+		var msg = (e && e.message) ? e.message : String(e);
 
-	const data = await callProxy(url, config, session_token);
-	delete odata_tokens[instance];
-	return Array.isArray(data) && data.length > 0 ? data[0][count_field] : 0;
+		logError("fetch", code, msg);
+		callProxy.error = true;
+		callProxy.last_error = msg;
+
+		return [];
+	}
 }
 
-// ---------------------------------------------
-// Data Query
-// ---------------------------------------------
+// =====================================
+// Count query
+// =====================================
 
-// Emit a batch either via hook or by accumulating
-function dispatchBatch(hooks, hooks_batch, mapped, results, serial_last)
+async function getCount(config, mode)
 {
-	if (hooks_batch)
-	{
-		const payload = (serial_last == null) ? { data: mapped, size: mapped.length } : { data: mapped, size: mapped.length, serial_last: serial_last };
+	var table = config.table, file = config.file, server = config.server;
+	var instance = config.instance || "default";
+	var token = Date.now().toString(36) + Math.random().toString(36).substring(2);
+	odata_tokens[instance] = token;
 
-		try
-		{
-			return hooks.onBatch(payload); 
-		}
-		catch (e)
-		{ 
-			// Ignore hook
-		}
-		return undefined;
-	}
-	else
+	var count_field = (config.mode && config.mode.count_field) ? config.mode.count_field : "_Count";
+	var select_fields = {}; select_fields[table] = {}; select_fields[table][count_field] = count_field;
+
+	var count_filter = {};
+	var base_filter = (config.filter || {});
+	for (var k in base_filter) if (Object.prototype.hasOwnProperty.call(base_filter, k)) count_filter[k] = base_filter[k];
+
+	if (mode === "modified")
 	{
-		results.push.apply(results, mapped);
-		return undefined;
+		var state = loadSync(file, table);
+		if (state && state.sync_timestamp)
+		{
+			var modify_field = (config.mode && config.mode.modify_field) ? config.mode.modify_field : "Timestamp Modify";
+			count_filter[modify_field] = { ge: state.sync_timestamp };
+		}
 	}
+
+	var qp = queryBuilder(select_fields, count_filter, table);
+	var url = getURL(server, file, table, qp, 1);
+
+	var rows = await callProxy(url, config, token);
+	delete odata_tokens[instance];
+
+	return (Array.isArray(rows) && rows.length > 0) ? rows[0][count_field] : 0;
+}
+
+// =====================================
+// Data fetch
+// =====================================
+
+function dispatchBatch(hooks, has_batch_hook, mapped, results, serial_last)
+{
+	if (has_batch_hook)
+	{
+		var payload = serial_last == null ? { data: mapped, size: mapped.length } : { data: mapped, size: mapped.length, serial_last: serial_last };
+		try { return hooks.onBatch(payload); } catch (_e) { return undefined; }
+	}
+	results.push.apply(results, mapped);
+	return undefined;
 }
 
 async function getData(config)
 {
-	const { table, file, server, mode } = config;
-	const instance = config.instance || "default";
-	const session_token = Date.now().toString(36) + Math.random().toString(36).substring(2);
-	odata_tokens[instance] = session_token;
+	var table = config.table, file = config.file, server = config.server, mode = config.mode || {};
+	var instance = config.instance || "default";
+	var token = Date.now().toString(36) + Math.random().toString(36).substring(2);
+	odata_tokens[instance] = token;
 
-	const limit = (mode && typeof mode.limit === 'number' && mode.limit > 0) ? (mode.limit | 0) : 10000;
-	const serial_field = (mode && typeof mode.serial_field === 'string' && mode.serial_field.trim()) ? mode.serial_field.trim()	: null;
-	const modify_field = (mode && typeof mode.modify_field === 'string' && mode.modify_field.trim()) ? mode.modify_field.trim() : null;
-	const types = (mode && mode.types && typeof mode.types === 'object') ? mode.types : null;
-	const hooks = (config && config.hooks && typeof config.hooks === 'object') ? config.hooks : null;
-	var hooks_batch = (hooks && typeof hooks.onBatch === 'function');
+	var limit = (typeof mode.limit === "number" && mode.limit > 0) ? (mode.limit | 0) : 10000;
+	var serial_field = (typeof mode.serial_field === "string" && mode.serial_field.trim()) ? mode.serial_field.trim() : null;
+	var modify_field = (typeof mode.modify_field === "string" && mode.modify_field.trim()) ? mode.modify_field.trim() : null;
+	var types = (mode.types && typeof mode.types === "object") ? mode.types : null;
+	var hooks = (config.hooks && typeof config.hooks === "object") ? config.hooks : null;
+	var has_batch = !!(hooks && typeof hooks.onBatch === "function");
 
-	// Collect on batch work so we can wait before complete
-	const batch_pending = [];
-	function checkPromise(v){ return v && typeof v.then === 'function'; }
-
-	// Require serial when doing modified sync
+	// Config validation
+	if (!config.select || !config.select[table] || typeof config.select[table] !== "object")
+	{
+		if (hooks && typeof hooks.onError === "function") { try { hooks.onError({ stage: "config", error: "Missing base table: " + table }); } catch (_e) {} }
+		return delete odata_tokens[instance], undefined;
+	}
 	if (modify_field && !serial_field)
 	{
-		if (hooks && typeof hooks.onError === 'function')
-		{
-			try { hooks.onError({ stage: 'config', error: 'Serial field is required for sync' }); } catch(e) {}
-		}
-		delete odata_tokens[instance];
-		return undefined;
+		if (hooks && typeof hooks.onError === "function") { try { hooks.onError({ stage: "config", error: "Serial field is required for sync" }); } catch (_e) {} }
+		return delete odata_tokens[instance], undefined;
 	}
 
-	// Ensure base table select exists
-	if (!config.select || !config.select[table] || typeof config.select[table] !== 'object')
-	{
-		if (hooks && typeof hooks.onError === 'function') { try { hooks.onError({ stage: 'config', error: 'Missing base table: ' + table }); } catch(e) {} }
-		delete odata_tokens[instance];
-		return undefined;
-	}
-
-	// Ensure serial field selected
+	// Ensure serial field selected when needed
 	if (serial_field && !config.select[table][serial_field]) config.select[table][serial_field] = serial_field;
 
-	const map_compiled = compileMapping(config.select, table);
-	const base_filter = { ...(config.filter || {}) };
+	var map_rules = compileMapping(config.select, table);
+	var base_filter = (config.filter || {});
+	var state = modify_field ? loadSync(file, table) : {};
+	var serial_last = (modify_field && state.serial_last != null) ? Number(state.serial_last) : null;
+	var sync_type = modify_field ? (!state.sync_complete ? "full" : "modified") : "live";
+	var ts = new Date();
 
-	var sync_state = modify_field ? loadSync(file, table) : {};
-	var serial_last = (modify_field && sync_state.serial_last != null) ? Number(sync_state.serial_last) : null;
-	const sync_type = modify_field ? (!sync_state.sync_complete ? 'full' : 'modified') : 'live';
-	const timestamp_start = new Date();
+	if (hooks && typeof hooks.onStart === "function") { try { hooks.onStart({ sync: sync_type }); } catch (_e) {} }
 
-	if (hooks && typeof hooks.onStart === 'function') { try { hooks.onStart({ sync: sync_type }); } catch(e) {} }
-
-	// Only set sync timestamp once for full sync
-	if (modify_field && sync_type === 'full' && !sync_state.sync_timestamp)
+	// For sync set start timestamp
+	if (modify_field && sync_type === "full" && !state.sync_timestamp)
 	{
-		sync_state.sync_timestamp = timestamp_start;
-		saveSync(file, table, sync_state);
+		state.sync_timestamp = ts;
+		saveSync(file, table, state);
 	}
 
-	var results = hooks_batch ? undefined : [];
-	var fetched;
+	var results = has_batch ? undefined : [];
+	var pending = [];
+
+	function isPromise(v){ return v && typeof v.then === "function"; }
 
 	// Full or live
-	if (sync_type === 'full' || sync_type === 'live')
+	if (sync_type === "full" || sync_type === "live")
 	{
 		if (!serial_field)
 		{
 			if (!checkHalt())
 			{
-				var qp = queryODATA(config.select, base_filter, table);
+				var qp = queryBuilder(config.select, base_filter, table);
 				var url = getURL(server, file, table, qp, limit);
-				var fetched = await callProxy(url, config, session_token);
-
-				if (fetched && fetched.length)
+				var rows = await callProxy(url, config, token);
+				if (rows && rows.length)
 				{
-					var mapped = applyMapping(fetched, map_compiled, types);
-					// Capture hook result and store promise if any
-					const batch_result = dispatchBatch(hooks, hooks_batch, mapped, results, null);
-					if (checkPromise(batch_result)) batch_pending.push(batch_result);
+					var mapped = applyMapping(rows, map_rules, types);
+					var r = dispatchBatch(hooks, has_batch, mapped, results, null);
+					if (isPromise(r)) pending.push(r);
 				}
 			}
 		}
 		else
 		{
+			var got = 0, rows;
 			do
 			{
 				if (checkHalt()) break;
 
-				var batch_filter = { ...base_filter };
-				if (serial_last !== null) batch_filter[serial_field] = { gt: serial_last };
+				var bf = {};
+				for (var k in base_filter) if (Object.prototype.hasOwnProperty.call(base_filter, k)) bf[k] = base_filter[k];
+				if (serial_last !== null) bf[serial_field] = { gt: serial_last };
 
-				var qp = queryODATA(config.select, batch_filter, table);
+				var qp = queryBuilder(config.select, bf, table);
 				var url = getURL(server, file, table, qp, limit);
-				fetched = await callProxy(url, config, session_token);
-				if (!fetched.length) break;
+				rows = await callProxy(url, config, token);
+				if (!rows.length) break;
 
-				var mapped = applyMapping(fetched, map_compiled, types);
-				var batch_max = getSerial(fetched, serial_field, serial_last);
+				var mapped = applyMapping(rows, map_rules, types);
+				var batch_max = getSerial(rows, serial_field, serial_last);
 
-				// Capture hook result and store promise if any
-				const batch_result = dispatchBatch(hooks, hooks_batch, mapped, results, batch_max);
-				if (checkPromise(batch_result)) batch_pending.push(batch_result);
+				var r = dispatchBatch(hooks, has_batch, mapped, results, batch_max);
+				if (isPromise(r)) pending.push(r);
 
 				serial_last = batch_max;
+				got += rows.length;
 
 				if (modify_field)
 				{
-					sync_state.serial_last = serial_last;
-					saveSync(file, table, sync_state);
+					state.serial_last = serial_last;
+					saveSync(file, table, state);
 				}
 			}
-			while (fetched.length === limit);
+			while (rows.length === limit);
 
-			if (modify_field && sync_type === 'full' && fetched && fetched.length < limit && callProxy.fetch_aborted === false && callProxy.error !== true)
+			// Mark full sync complete only when last page fetched cleanly
+			if (modify_field && sync_type === "full" && rows && rows.length < limit && callProxy.fetch_aborted === false && callProxy.error !== true)
 			{
-				sync_state.sync_complete = true;
-				saveSync(file, table, sync_state);
+				state.sync_complete = true;
+				saveSync(file, table, state);
 			}
 		}
 	}
 
-	// Modified records
-	if (modify_field && sync_type === 'modified')
+	// Modified
+	if (modify_field && sync_type === "modified")
 	{
-		var keep_checking = true;
-		while (keep_checking)
+		var keep = true;
+		while (keep)
 		{
 			if (checkHalt()) break;
 
 			var cycle_start = new Date();
-			var cycle_processed = 0;
+			var processed = 0;
 			var page_serial = null;
-			var cycle_ok = true;
+			var ok = true;
+			var rowsm;
 
 			do
 			{
-				if (checkHalt()) { cycle_ok = false; break; }
+				if (checkHalt()) { ok = false; break; }
 
-				var bf = { ...base_filter };
-				if (sync_state.sync_timestamp) bf[modify_field] = { ge: sync_state.sync_timestamp };
+				var bf = {};
+				for (var k in base_filter) if (Object.prototype.hasOwnProperty.call(base_filter, k)) bf[k] = base_filter[k];
+				if (state.sync_timestamp) bf[modify_field] = { ge: state.sync_timestamp };
 				if (page_serial !== null) bf[serial_field] = { gt: page_serial };
 
-				var qp_mod = queryODATA(config.select, bf, table);
-				var url_mod = getURL(server, file, table, qp_mod, limit);
-				fetched = await callProxy(url_mod, config, session_token);
-				if (!fetched.length) break;
+				var qpm = queryBuilder(config.select, bf, table);
+				var urlm = getURL(server, file, table, qpm, limit);
+				rowsm = await callProxy(urlm, config, token);
+				if (!rowsm.length) break;
 
-				var mapped_mod = applyMapping(fetched, map_compiled, types);
-				var batch_max_mod = getSerial(fetched, serial_field, page_serial);
+				var mappedm = applyMapping(rowsm, map_rules, types);
+				var maxm = getSerial(rowsm, serial_field, page_serial);
 
-				// Capture hook result and store promise if any
-				const batch_result = dispatchBatch(hooks, hooks_batch, mapped_mod, results, batch_max_mod);
-				if (checkPromise(batch_result)) batch_pending.push(batch_result);
+				var rm = dispatchBatch(hooks, has_batch, mappedm, results, maxm);
+				if (isPromise(rm)) pending.push(rm);
 
-				cycle_processed += fetched.length;
-				page_serial = batch_max_mod;
+				processed += rowsm.length;
+				page_serial = maxm;
 			}
-			while (fetched.length === limit);
+			while (rowsm.length === limit);
 
-			if (checkHalt()) cycle_ok = false;
-
-			// Advance only when the entire cycle completed
-			if (cycle_processed === 0) { keep_checking = false; break; }
-			if (cycle_ok)
+			if (checkHalt()) ok = false;
+			if (processed === 0) { keep = false; break; }
+			if (ok)
 			{
-				sync_state.sync_timestamp = cycle_start;
-				saveSync(file, table, sync_state);
+				state.sync_timestamp = cycle_start;
+				saveSync(file, table, state);
 			}
 		}
 	}
 
-	// Error hook
-	if (hooks && typeof hooks.onError === 'function' && callProxy.error === true)
+	// Hook errors
+	if (hooks && typeof hooks.onError === "function" && callProxy.error === true)
 	{
-		try { hooks.onError({ stage: 'fetch', error: callProxy.last_error || 'ODATA fetch error' }); } catch(e) {}
+		try { hooks.onError({ stage: "fetch", error: callProxy.last_error || "Fetch error" }); } catch (_e) {}
 	}
 
-	// Recount hook after modified run
-	if (modify_field && sync_type === 'modified' && callProxy.fetch_aborted === false && callProxy.error !== true && hooks && typeof hooks.onRecount === 'function')
+	// Recount after modified run
+	if (modify_field && sync_type === "modified" && callProxy.fetch_aborted === false && callProxy.error !== true && hooks && typeof hooks.onRecount === "function")
 	{
-		const server_recount = await getCount(config, 'base');
-		try { hooks.onRecount(server_recount); } catch(e) {}
+		var server_recount = await getCount(config, "base");
+		try { hooks.onRecount(server_recount); } catch (_e) {}
 	}
 
 	delete odata_tokens[instance];
 
-	// Notify clean aborts to hooks
-	if (hooks && callProxy.fetch_aborted === true && callProxy.error !== true && typeof hooks.onError === 'function')
+	// Clean abort notice
+	if (hooks && callProxy.fetch_aborted === true && callProxy.error !== true && typeof hooks.onError === "function")
 	{
-		try { hooks.onError({ stage: 'abort', error: 'Fetch aborted' }); } catch(e) {}
+		try { hooks.onError({ stage: "abort", error: "Fetch aborted" }); } catch (_e) {}
 	}
 
-	// Ensure all on batch tasks are finished before
-	if (batch_pending.length)
+	// Await any work returned by on batch
+	if (pending.length)
 	{
-		try { await Promise.allSettled(batch_pending); } catch (e) { }
+		try { await Promise.allSettled(pending); } catch (_e) {}
 	}
 
-	if (hooks && typeof hooks.onComplete === 'function')
+	if (hooks && typeof hooks.onComplete === "function")
 	{
-		try { hooks.onComplete({ sync: sync_type, data: (hooks_batch ? undefined : results) }); } catch(e) {}
+		try { hooks.onComplete({ sync: sync_type, data: (has_batch ? undefined : results) }); } catch (_e) {}
 	}
 
-	return hooks_batch ? undefined : results;
+	return has_batch ? undefined : results;
 }
 
-// ---------------------------------------------
-// Unified Entry Point
-// ---------------------------------------------
+// =====================================
+// Unified entry point
+// =====================================
 
 async function callODATA(config)
 {
@@ -558,40 +598,37 @@ async function callODATA(config)
 	callProxy.error = false;
 	callProxy.last_error = null;
 
-	console.time('ODATA Retrieval');
+	console.time("Data retrieval");
 
 	var server_count = 0;
-	var hooks = (config && config.hooks && typeof config.hooks === 'object') ? config.hooks : null;
+	var hooks = (config && config.hooks && typeof config.hooks === "object") ? config.hooks : null;
 
-	// If caller requires count
-	if (hooks && typeof hooks.onCount === 'function')
+	// Optional count
+	if (hooks && typeof hooks.onCount === "function")
 	{
-		var sync_probe = (config.mode && typeof config.mode.modify_field === 'string' && config.mode.modify_field.trim()) ? loadSync(config.file, config.table) : null;
-		var count_mode = (sync_probe && sync_probe.sync_complete === true && sync_probe.sync_timestamp) ? 'modified' : 'base';
-		server_count = await getCount(config, count_mode);
-		try { hooks.onCount(server_count); } catch(e) {}
+		var probe = (config.mode && typeof config.mode.modify_field === "string" && config.mode.modify_field.trim()) ? loadSync(config.file, config.table) : null;
+		var mode = (probe && probe.sync_complete === true && probe.sync_timestamp) ? "modified" : "base";
+		server_count = await getCount(config, mode);
+		try { hooks.onCount(server_count); } catch (_e) {}
 	}
 
-	var data, error_in_call = null;
+	var output, pipeline_err = null;
 
 	try
 	{
-		data = await getData(config);
+		output = await getData(config);
 	}
 	catch (err)
 	{
-		error_in_call = err && err.message ? err.message : String(err);
-		if (hooks && typeof hooks.onError === 'function')
+		pipeline_err = (err && err.message) ? err.message : String(err);
+		if (hooks && typeof hooks.onError === "function")
 		{
-			try { hooks.onError({ stage: 'pipeline', error: error_in_call }); } catch(e) {}
+			try { hooks.onError({ stage: "pipeline", error: pipeline_err }); } catch (_e) {}
 		}
+		logError("pipeline", ERR_NET, pipeline_err);
 	}
 
-	console.timeEnd('ODATA Retrieval');
+	console.timeEnd("Data retrieval");
 
-	return { output: data, count: server_count, error: error_in_call };
+	return { output: output, count: server_count, error: pipeline_err };
 }
-
-// ==============================
-// Helper Function Stop
-// ==============================
