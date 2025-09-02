@@ -1,6 +1,7 @@
-// Version 2.2.1
-// Refactoring and renaming of functions and objects
-// Dramatically improved error handling with clearer feedback in console
+// Version 2.2.2
+// Moves the types registry function from mode into the root of the config
+// Introduced a backoff (milliseconds) modifier that will roll the synchronised timestamp back to ensure coverage
+// Introduce a max modified loop count to allow the breaking of new records being retrieved
 
 // =====================================
 // Globals
@@ -8,6 +9,8 @@
 
 var RE_DATE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 var RE_NUMBER = /^-?\d+(?:\.\d+)?$/;
+var BACKOFF_MS = 2000;
+var MODIFIED_PASS = 1;
 
 var odata_tokens = {};
 var odata_abort = new AbortController();
@@ -29,7 +32,7 @@ function logError(stage, code, info)
 
 function parseError(data)
 {
-	// API errors
+	// Error handling for api
 	if (!data || typeof data !== "object" || !data.error) return null;
 
 	var err = data.error;
@@ -82,7 +85,7 @@ function saveSync(file, table, state)
 }
 
 // =====================================
-// Shared Helpers
+// Shared helpers
 // =====================================
 
 function getSerial(rows, field, current)
@@ -403,7 +406,7 @@ async function getData(config)
 	var limit = (typeof mode.limit === "number" && mode.limit > 0) ? (mode.limit | 0) : 10000;
 	var serial_field = (typeof mode.serial_field === "string" && mode.serial_field.trim()) ? mode.serial_field.trim() : null;
 	var modify_field = (typeof mode.modify_field === "string" && mode.modify_field.trim()) ? mode.modify_field.trim() : null;
-	var types = (mode.types && typeof mode.types === "object") ? mode.types : null;
+	var types = (config.types && typeof config.types === "object") ? config.types : null;
 	var hooks = (config.hooks && typeof config.hooks === "object") ? config.hooks : null;
 	var has_batch = !!(hooks && typeof hooks.onBatch === "function");
 
@@ -427,7 +430,7 @@ async function getData(config)
 	var state = modify_field ? loadSync(file, table) : {};
 	var serial_last = (modify_field && state.serial_last != null) ? Number(state.serial_last) : null;
 	var sync_type = modify_field ? (!state.sync_complete ? "full" : "modified") : "live";
-	var ts = new Date();
+	var ts = new Date(Date.now() - BACKOFF_MS);
 
 	if (hooks && typeof hooks.onStart === "function") { try { hooks.onStart({ sync: sync_type }); } catch (_e) {} }
 
@@ -506,12 +509,12 @@ async function getData(config)
 	// Modified
 	if (modify_field && sync_type === "modified")
 	{
-		var keep = true;
+		var keep = true, loops = 0;
 		while (keep)
 		{
 			if (checkHalt()) break;
 
-			var cycle_start = new Date();
+			var cycle_start = new Date(Date.now() - BACKOFF_MS);
 			var processed = 0;
 			var page_serial = null;
 			var ok = true;
@@ -549,6 +552,7 @@ async function getData(config)
 				state.sync_timestamp = cycle_start;
 				saveSync(file, table, state);
 			}
+			if (++loops >= MODIFIED_PASS) { keep = false; break; }
 		}
 	}
 
