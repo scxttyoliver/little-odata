@@ -1,7 +1,5 @@
-// Version 2.2.2
-// Moves the types registry function from mode into the root of the config
-// Introduced a backoff (milliseconds) modifier that will roll the synchronised timestamp back to ensure coverage
-// Introduce a max modified loop count to allow the breaking of new records being retrieved
+// Version 2.2.3
+// Better collission and multi call handling
 
 // =====================================
 // Globals
@@ -99,9 +97,11 @@ function getSerial(rows, field, current)
 	return hi;
 }
 
-function checkHalt()
+function checkHalt(instance, token)
 {
-	return (odata_abort && odata_abort.signal && odata_abort.signal.aborted === true) || callProxy.error === true || callProxy.fetch_aborted === true;
+	const active = (odata_tokens[instance] === token);
+	const aborted = (typeof odata_abort?.signal?.aborted === "boolean") ? odata_abort.signal.aborted : false;
+	return (active && (aborted || callProxy.error === true || callProxy.fetch_aborted === true));
 }
 
 function encodeField(field)
@@ -348,13 +348,9 @@ async function callProxy(url, config, token)
 // Count query
 // =====================================
 
-async function getCount(config, mode)
+async function getCount(config, mode, token)
 {
 	var table = config.table, file = config.file, server = config.server;
-	var instance = config.instance || "default";
-	var token = Date.now().toString(36) + Math.random().toString(36).substring(2);
-	odata_tokens[instance] = token;
-
 	var count_field = (config.mode && config.mode.count_field) ? config.mode.count_field : "_Count";
 	var select_fields = {}; select_fields[table] = {}; select_fields[table][count_field] = count_field;
 
@@ -376,7 +372,6 @@ async function getCount(config, mode)
 	var url = getURL(server, file, table, qp, 1);
 
 	var rows = await callProxy(url, config, token);
-	delete odata_tokens[instance];
 
 	return (Array.isArray(rows) && rows.length > 0) ? rows[0][count_field] : 0;
 }
@@ -385,24 +380,22 @@ async function getCount(config, mode)
 // Data fetch
 // =====================================
 
-function dispatchBatch(hooks, has_batch_hook, mapped, results, serial_last)
+function dispatchBatch(hooks, has_batch_hook, mapped, results, serial_last, instance, token)
 {
 	if (has_batch_hook)
 	{
-		var payload = serial_last == null ? { data: mapped, size: mapped.length } : { data: mapped, size: mapped.length, serial_last: serial_last };
+		if (odata_tokens[instance] !== token) return undefined;
+		var payload = (serial_last == null) ? { data: mapped, size: mapped.length } : { data: mapped, size: mapped.length, serial_last: serial_last };
 		try { return hooks.onBatch(payload); } catch (_e) { return undefined; }
 	}
 	results.push.apply(results, mapped);
 	return undefined;
 }
 
-async function getData(config)
+async function getData(config, token)
 {
 	var table = config.table, file = config.file, server = config.server, mode = config.mode || {};
 	var instance = config.instance || "default";
-	var token = Date.now().toString(36) + Math.random().toString(36).substring(2);
-	odata_tokens[instance] = token;
-
 	var limit = (typeof mode.limit === "number" && mode.limit > 0) ? (mode.limit | 0) : 10000;
 	var serial_field = (typeof mode.serial_field === "string" && mode.serial_field.trim()) ? mode.serial_field.trim() : null;
 	var modify_field = (typeof mode.modify_field === "string" && mode.modify_field.trim()) ? mode.modify_field.trim() : null;
@@ -414,12 +407,12 @@ async function getData(config)
 	if (!config.select || !config.select[table] || typeof config.select[table] !== "object")
 	{
 		if (hooks && typeof hooks.onError === "function") { try { hooks.onError({ stage: "config", error: "Missing base table: " + table }); } catch (_e) {} }
-		return delete odata_tokens[instance], undefined;
+		return undefined;
 	}
 	if (modify_field && !serial_field)
 	{
 		if (hooks && typeof hooks.onError === "function") { try { hooks.onError({ stage: "config", error: "Serial field is required for sync" }); } catch (_e) {} }
-		return delete odata_tokens[instance], undefined;
+		return undefined;
 	}
 
 	// Ensure serial field selected when needed
@@ -432,10 +425,10 @@ async function getData(config)
 	var sync_type = modify_field ? (!state.sync_complete ? "full" : "modified") : "live";
 	var ts = new Date(Date.now() - BACKOFF_MS);
 
-	if (hooks && typeof hooks.onStart === "function") { try { hooks.onStart({ sync: sync_type }); } catch (_e) {} }
+	if (hooks && typeof hooks.onStart === "function" && odata_tokens[instance] === token) try { hooks.onStart({ sync: sync_type }); } catch (_e) {}
 
 	// For sync set start timestamp
-	if (modify_field && sync_type === "full" && !state.sync_timestamp)
+	if (modify_field && sync_type === "full" && !state.sync_timestamp && odata_tokens[instance] === token)
 	{
 		state.sync_timestamp = ts;
 		saveSync(file, table, state);
@@ -451,7 +444,7 @@ async function getData(config)
 	{
 		if (!serial_field)
 		{
-			if (!checkHalt())
+			if (!checkHalt(instance, token))
 			{
 				var qp = queryBuilder(config.select, base_filter, table);
 				var url = getURL(server, file, table, qp, limit);
@@ -459,7 +452,7 @@ async function getData(config)
 				if (rows && rows.length)
 				{
 					var mapped = applyMapping(rows, map_rules, types);
-					var r = dispatchBatch(hooks, has_batch, mapped, results, null);
+					var r = dispatchBatch(hooks, has_batch, mapped, results, null, instance, token);
 					if (isPromise(r)) pending.push(r);
 				}
 			}
@@ -469,7 +462,7 @@ async function getData(config)
 			var got = 0, rows;
 			do
 			{
-				if (checkHalt()) break;
+				if (checkHalt(instance, token)) break;
 
 				var bf = {};
 				for (var k in base_filter) if (Object.prototype.hasOwnProperty.call(base_filter, k)) bf[k] = base_filter[k];
@@ -483,13 +476,13 @@ async function getData(config)
 				var mapped = applyMapping(rows, map_rules, types);
 				var batch_max = getSerial(rows, serial_field, serial_last);
 
-				var r = dispatchBatch(hooks, has_batch, mapped, results, batch_max);
+				var r = dispatchBatch(hooks, has_batch, mapped, results, batch_max, instance, token);
 				if (isPromise(r)) pending.push(r);
 
 				serial_last = batch_max;
 				got += rows.length;
 
-				if (modify_field)
+				if (modify_field && odata_tokens[instance] === token)
 				{
 					state.serial_last = serial_last;
 					saveSync(file, table, state);
@@ -498,7 +491,7 @@ async function getData(config)
 			while (rows.length === limit);
 
 			// Mark full sync complete only when last page fetched cleanly
-			if (modify_field && sync_type === "full" && rows && rows.length < limit && callProxy.fetch_aborted === false && callProxy.error !== true)
+			if (modify_field && sync_type === "full" && rows && rows.length < limit && callProxy.fetch_aborted === false && callProxy.error !== true && odata_tokens[instance] === token)
 			{
 				state.sync_complete = true;
 				saveSync(file, table, state);
@@ -512,7 +505,7 @@ async function getData(config)
 		var keep = true, loops = 0;
 		while (keep)
 		{
-			if (checkHalt()) break;
+			if (checkHalt(instance, token)) break;
 
 			var cycle_start = new Date(Date.now() - BACKOFF_MS);
 			var processed = 0;
@@ -522,7 +515,7 @@ async function getData(config)
 
 			do
 			{
-				if (checkHalt()) { ok = false; break; }
+				if (checkHalt(instance, token)) { ok = false; break; }
 
 				var bf = {};
 				for (var k in base_filter) if (Object.prototype.hasOwnProperty.call(base_filter, k)) bf[k] = base_filter[k];
@@ -537,7 +530,7 @@ async function getData(config)
 				var mappedm = applyMapping(rowsm, map_rules, types);
 				var maxm = getSerial(rowsm, serial_field, page_serial);
 
-				var rm = dispatchBatch(hooks, has_batch, mappedm, results, maxm);
+				var rm = dispatchBatch(hooks, has_batch, mappedm, results, maxm, instance, token);
 				if (isPromise(rm)) pending.push(rm);
 
 				processed += rowsm.length;
@@ -545,9 +538,9 @@ async function getData(config)
 			}
 			while (rowsm.length === limit);
 
-			if (checkHalt()) ok = false;
+			if (checkHalt(instance, token)) ok = false;
 			if (processed === 0) { keep = false; break; }
-			if (ok)
+			if (ok && odata_tokens[instance] === token)
 			{
 				state.sync_timestamp = cycle_start;
 				saveSync(file, table, state);
@@ -557,22 +550,20 @@ async function getData(config)
 	}
 
 	// Hook errors
-	if (hooks && typeof hooks.onError === "function" && callProxy.error === true)
+	if (hooks && typeof hooks.onError === "function" && callProxy.error === true && odata_tokens[instance] === token)
 	{
 		try { hooks.onError({ stage: "fetch", error: callProxy.last_error || "Fetch error" }); } catch (_e) {}
 	}
 
 	// Recount after modified run
-	if (modify_field && sync_type === "modified" && callProxy.fetch_aborted === false && callProxy.error !== true && hooks && typeof hooks.onRecount === "function")
+	if (modify_field && sync_type === "modified" && callProxy.fetch_aborted === false && callProxy.error !== true && hooks && typeof hooks.onRecount === "function" && odata_tokens[instance] === token)
 	{
-		var server_recount = await getCount(config, "base");
+		var server_recount = await getCount(config, "base", token);
 		try { hooks.onRecount(server_recount); } catch (_e) {}
 	}
 
-	delete odata_tokens[instance];
-
 	// Clean abort notice
-	if (hooks && callProxy.fetch_aborted === true && callProxy.error !== true && typeof hooks.onError === "function")
+	if (hooks && callProxy.fetch_aborted === true && callProxy.error !== true && typeof hooks.onError === "function" && odata_tokens[instance] === token)
 	{
 		try { hooks.onError({ stage: "abort", error: "Fetch aborted" }); } catch (_e) {}
 	}
@@ -583,7 +574,7 @@ async function getData(config)
 		try { await Promise.allSettled(pending); } catch (_e) {}
 	}
 
-	if (hooks && typeof hooks.onComplete === "function")
+	if (hooks && typeof hooks.onComplete === "function" && odata_tokens[instance] === token)
 	{
 		try { hooks.onComplete({ sync: sync_type, data: (has_batch ? undefined : results) }); } catch (_e) {}
 	}
@@ -597,6 +588,9 @@ async function getData(config)
 
 async function callODATA(config)
 {
+	var instance = (config && config.instance) ? config.instance : "default";
+	var token = Date.now().toString(36) + Math.random().toString(36).substring(2);
+	odata_tokens[instance] = token;
 	odata_abort = new AbortController();
 	callProxy.fetch_aborted = false;
 	callProxy.error = false;
@@ -612,15 +606,15 @@ async function callODATA(config)
 	{
 		var probe = (config.mode && typeof config.mode.modify_field === "string" && config.mode.modify_field.trim()) ? loadSync(config.file, config.table) : null;
 		var mode = (probe && probe.sync_complete === true && probe.sync_timestamp) ? "modified" : "base";
-		server_count = await getCount(config, mode);
-		try { hooks.onCount(server_count); } catch (_e) {}
+		server_count = await getCount(config, mode, token);
+		if (odata_tokens[instance] === token) { try { hooks.onCount(server_count); } catch (_e) {} }
 	}
 
 	var output, pipeline_err = null;
 
 	try
 	{
-		output = await getData(config);
+		output = await getData(config, token);
 	}
 	catch (err)
 	{
@@ -631,7 +625,7 @@ async function callODATA(config)
 		}
 		logError("pipeline", ERR_NET, pipeline_err);
 	}
-
+	if (odata_tokens[instance] === token) delete odata_tokens[instance];
 	console.timeEnd("Data retrieval");
 
 	return { output: output, count: server_count, error: pipeline_err };
