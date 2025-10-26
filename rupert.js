@@ -1,17 +1,22 @@
-// Version 2.2.3
-// Better collission and multi call handling
+// Version 2.2.4
+// Further improvement to collision detection including cooldown to ensure multiple helpers can't be fired in quick succession
+// Better state advancement following commitment from indexed database
+// Improved types for data formatting
 
 // =====================================
 // Globals
 // =====================================
 
-var RE_DATE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+var RE_DATE = /^\d{4}-\d{2}-\d{2}$/;
+var RE_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?$/;
 var RE_NUMBER = /^-?\d+(?:\.\d+)?$/;
+var COOLDOWN_MS = 1000;
 var BACKOFF_MS = 2000;
 var MODIFIED_PASS = 1;
 
 var odata_tokens = {};
 var odata_abort = new AbortController();
+var odata_last = {};
 
 // =====================================
 // Error helper
@@ -113,7 +118,7 @@ function encodeValue(val)
 {
 	if (val === null || val === undefined) return "null";
 	if (val instanceof Date) return val.toISOString();
-	if (typeof val === "string" && RE_DATE.test(val)) return val;
+	if (typeof val === "string" && (RE_DATE.test(val) || RE_TIMESTAMP.test(val))) return val;
 	if (typeof val === "string") return "'" + val.replace(/'/g, "''") + "'";
 	if (typeof val !== "number" && typeof val !== "boolean") return "'" + String(val) + "'";
 	return val;
@@ -238,10 +243,23 @@ function normaliseTypes(key, value, types)
 		return value;
 	}
 
-	if (want === "date")
+	if (want === "timestamp")
 	{
 		if (value instanceof Date) return value;
-		if (typeof value === "string" && RE_DATE.test(value)) return new Date(value);
+		if (typeof value === "string" && RE_TIMESTAMP.test(value)) return new Date(value);
+		if (typeof value === "string" && RE_DATE.test(value)) return new Date(value + "T00:00:00");
+		return value;
+	}
+
+	if (want === "date")
+	{
+		if (value instanceof Date) return new Date(value.getFullYear(), value.getMonth(), value.getDate());
+		if (typeof value === "string" && RE_DATE.test(value)) return new Date(value + "T00:00:00");
+		if (typeof value === "string" && RE_TIMESTAMP.test(value))
+		{
+			var out = new Date(value);
+			return new Date(out.getFullYear(), out.getMonth(), out.getDate());
+		}
 		return value;
 	}
 
@@ -477,7 +495,7 @@ async function getData(config, token)
 				var batch_max = getSerial(rows, serial_field, serial_last);
 
 				var r = dispatchBatch(hooks, has_batch, mapped, results, batch_max, instance, token);
-				if (isPromise(r)) pending.push(r);
+				if (isPromise(r)) { try { await r; } catch (_e) {} }
 
 				serial_last = batch_max;
 				got += rows.length;
@@ -588,15 +606,19 @@ async function getData(config, token)
 
 async function callODATA(config)
 {
+	console.time("Data retrieval");
 	var instance = (config && config.instance) ? config.instance : "default";
+	var now = Date.now();
+	if (odata_tokens[instance]) return { output: undefined, count: 0, error: null };
+	if (COOLDOWN_MS > 0 && odata_last[instance] && (now - odata_last[instance]) < COOLDOWN_MS) return { output: undefined, count: 0, error: null };
+
 	var token = Date.now().toString(36) + Math.random().toString(36).substring(2);
 	odata_tokens[instance] = token;
 	odata_abort = new AbortController();
+
 	callProxy.fetch_aborted = false;
 	callProxy.error = false;
 	callProxy.last_error = null;
-
-	console.time("Data retrieval");
 
 	var server_count = 0;
 	var hooks = (config && config.hooks && typeof config.hooks === "object") ? config.hooks : null;
@@ -625,7 +647,11 @@ async function callODATA(config)
 		}
 		logError("pipeline", ERR_NET, pipeline_err);
 	}
-	if (odata_tokens[instance] === token) delete odata_tokens[instance];
+	finally
+	{
+		if (odata_tokens[instance] === token) delete odata_tokens[instance];
+		odata_last[instance] = Date.now();
+	}
 	console.timeEnd("Data retrieval");
 
 	return { output: output, count: server_count, error: pipeline_err };
