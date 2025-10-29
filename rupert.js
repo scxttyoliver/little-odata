@@ -1,7 +1,7 @@
-// Version 2.2.4
-// Further improvement to collision detection including cooldown to ensure multiple helpers can't be fired in quick succession
-// Better state advancement following commitment from indexed database
-// Improved types for data formatting
+// Version 2.2.5
+// Rollback of cooldown to prevent multiple data sources from colliding
+// Improved comaptibiltiy with multiple calls to allow concurrent helpers
+// Further prevention of premature state advancement
 
 // =====================================
 // Globals
@@ -10,13 +10,11 @@
 var RE_DATE = /^\d{4}-\d{2}-\d{2}$/;
 var RE_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?$/;
 var RE_NUMBER = /^-?\d+(?:\.\d+)?$/;
-var COOLDOWN_MS = 1000;
 var BACKOFF_MS = 2000;
 var MODIFIED_PASS = 1;
 
 var odata_tokens = {};
 var odata_abort = new AbortController();
-var odata_last = {};
 
 // =====================================
 // Error helper
@@ -444,8 +442,6 @@ async function getData(config, token)
 	var ts = new Date(Date.now() - BACKOFF_MS);
 
 	if (hooks && typeof hooks.onStart === "function" && odata_tokens[instance] === token) try { hooks.onStart({ sync: sync_type }); } catch (_e) {}
-
-	// For sync set start timestamp
 	if (modify_field && sync_type === "full" && !state.sync_timestamp && odata_tokens[instance] === token)
 	{
 		state.sync_timestamp = ts;
@@ -489,13 +485,19 @@ async function getData(config, token)
 				var qp = queryBuilder(config.select, bf, table);
 				var url = getURL(server, file, table, qp, limit);
 				rows = await callProxy(url, config, token);
-				if (!rows.length) break;
+
+				if (!Array.isArray(rows) || rows.length === 0)
+				{
+					if (checkHalt(instance, token)) break;
+					break;
+				}
 
 				var mapped = applyMapping(rows, map_rules, types);
 				var batch_max = getSerial(rows, serial_field, serial_last);
 
 				var r = dispatchBatch(hooks, has_batch, mapped, results, batch_max, instance, token);
 				if (isPromise(r)) { try { await r; } catch (_e) {} }
+				if (checkHalt(instance, token)) break;
 
 				serial_last = batch_max;
 				got += rows.length;
@@ -509,10 +511,21 @@ async function getData(config, token)
 			while (rows.length === limit);
 
 			// Mark full sync complete only when last page fetched cleanly
-			if (modify_field && sync_type === "full" && rows && rows.length < limit && callProxy.fetch_aborted === false && callProxy.error !== true && odata_tokens[instance] === token)
+			if (modify_field && odata_tokens[instance] === token)
 			{
-				state.sync_complete = true;
-				saveSync(file, table, state);
+				const is_valid = (callProxy.fetch_aborted === false && callProxy.error !== true);
+				const is_final_batch = (sync_type === "full" && Array.isArray(rows) && rows.length < limit);
+
+				if (is_valid && is_final_batch)
+				{
+					state.sync_complete = true;
+				}
+
+				// Persist if the run was valid OR we have any meaningful progress/anchor persisted.
+				if (is_valid || state.serial_last != null || state.sync_timestamp != null)
+				{
+					saveSync(file, table, state);
+				}
 			}
 		}
 	}
@@ -606,19 +619,15 @@ async function getData(config, token)
 
 async function callODATA(config)
 {
-	console.time("Data retrieval");
 	var instance = (config && config.instance) ? config.instance : "default";
-	var now = Date.now();
-	if (odata_tokens[instance]) return { output: undefined, count: 0, error: null };
-	if (COOLDOWN_MS > 0 && odata_last[instance] && (now - odata_last[instance]) < COOLDOWN_MS) return { output: undefined, count: 0, error: null };
-
 	var token = Date.now().toString(36) + Math.random().toString(36).substring(2);
 	odata_tokens[instance] = token;
 	odata_abort = new AbortController();
-
 	callProxy.fetch_aborted = false;
 	callProxy.error = false;
 	callProxy.last_error = null;
+
+	console.time("Data retrieval");
 
 	var server_count = 0;
 	var hooks = (config && config.hooks && typeof config.hooks === "object") ? config.hooks : null;
@@ -647,11 +656,7 @@ async function callODATA(config)
 		}
 		logError("pipeline", ERR_NET, pipeline_err);
 	}
-	finally
-	{
-		if (odata_tokens[instance] === token) delete odata_tokens[instance];
-		odata_last[instance] = Date.now();
-	}
+	if (odata_tokens[instance] === token) delete odata_tokens[instance];
 	console.timeEnd("Data retrieval");
 
 	return { output: output, count: server_count, error: pipeline_err };
